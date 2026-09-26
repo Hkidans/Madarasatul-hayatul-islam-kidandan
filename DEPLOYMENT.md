@@ -36,3 +36,7 @@ To send notifications to hallirukidans@gmail.com, configure SMTP. For Gmail, use
 - Restrict admin access.
 - Do not upload .env.
 - Consider PostgreSQL for a very large school.
+
+
+### Render compatibility note
+This build pins Node.js to 24.21.0 and uses better-sqlite3 12.x to match current Render Node 24 deployments.
