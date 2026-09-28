@@ -11,6 +11,7 @@ const crypto = require("crypto");
 require("dotenv").config();
 
 const app = express();
+app.set("trust proxy", 1);
 const PORT = Number(process.env.PORT || 3000);
 const DATA = path.join(__dirname, "data");
 fs.mkdirSync(DATA, {recursive:true});
@@ -24,7 +25,7 @@ CREATE TABLE IF NOT EXISTS admins(
  password_hash TEXT NOT NULL,created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS classes(
- id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,section TEXT DEFAULT '',
+ id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,section TEXT DEFAULT '',category TEXT DEFAULT 'Academy',
  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS students(
@@ -56,7 +57,26 @@ CREATE TABLE IF NOT EXISTS fees(
 );
 `);
 
+// Upgrade older databases created before category support.
+try { db.prepare("ALTER TABLE classes ADD COLUMN category TEXT DEFAULT 'Academy'").run(); } catch (e) { if (!String(e.message).includes("duplicate column name")) throw e; }
+
 const now=()=>new Date().toISOString();
+
+// School divisions and their levels.
+const classGroups = {
+  "Islamiyya": ["Pre-Ibtidaiyya 1", "Pre-Ibtidaiyya 2", "Ibtidaiyya 1", "Ibtidaiyya 2", "Ibtidaiyya 3", "Ibtidaiyya 4", "Ibtidaiyya 5", "Ibtidaiyya 6"],
+  "Hifz": ["Hifz 1", "Hifz 2", "Hifz 3", "Hifz 4", "Hifz 5", "Hifz 6"],
+  "Academy": ["Nursery 1", "Nursery 2", "Nursery 3", "Primary 1", "Primary 2", "Primary 3", "Primary 4", "Primary 5", "JSS 1", "JSS 2", "JSS 3", "SS 1", "SS 2", "SS 3"]
+};
+const insertClass = db.prepare("INSERT OR IGNORE INTO classes(name,section,category,created_at) VALUES(?,?,?,?)");
+for (const [category, levels] of Object.entries(classGroups)) {
+  for (const level of levels) insertClass.run(level, "", category, now());
+}
+// Older installations had the first Academy levels without a category. Keep their data, but classify them.
+const allowedLevels = Object.values(classGroups).flat();
+const placeholders = allowedLevels.map(()=>"?").join(",");
+db.prepare(`UPDATE classes SET category=CASE WHEN name IN (${placeholders}) THEN category ELSE 'Legacy' END`).run(...allowedLevels);
+
 const clean=(v,n=300)=>String(v??"").trim().slice(0,n);
 const schoolEmail=process.env.SCHOOL_EMAIL||"hallirukidans@gmail.com";
 const generalPassword=process.env.GENERAL_PASSWORD||"ChangeThisGeneralPassword";
@@ -94,10 +114,16 @@ async function mail(subject,text){
 }
 
 const adminEmail=(process.env.ADMIN_EMAIL||"admin@school.local").toLowerCase();
-if(!db.prepare("SELECT id FROM admins WHERE email=?").get(adminEmail)){
+const configuredAdminName=process.env.ADMIN_NAME||"School Administrator";
+const configuredAdminPassword=process.env.ADMIN_PASSWORD||"ChangeThisStrongAdminPassword";
+const existingAdmin=db.prepare("SELECT id FROM admins WHERE email=?").get(adminEmail);
+if(!existingAdmin){
   db.prepare("INSERT INTO admins(name,email,password_hash,created_at) VALUES(?,?,?,?)")
-    .run(process.env.ADMIN_NAME||"School Administrator",adminEmail,
-      bcrypt.hashSync(process.env.ADMIN_PASSWORD||"ChangeThisStrongAdminPassword",12),now());
+    .run(configuredAdminName,adminEmail,bcrypt.hashSync(configuredAdminPassword,12),now());
+}else if(process.env.ADMIN_PASSWORD){
+  // Keep the persistent database in sync with the password configured in Render.
+  db.prepare("UPDATE admins SET name=?,password_hash=? WHERE email=?")
+    .run(configuredAdminName,bcrypt.hashSync(configuredAdminPassword,12),adminEmail);
 }
 
 app.use(helmet({contentSecurityPolicy:false}));
@@ -111,7 +137,7 @@ app.use(session({
 app.use(express.static(path.join(__dirname,"public")));
 const limiter=rateLimit({windowMs:15*60*1000,limit:40});
 
-app.get("/api/public/classes",(req,res)=>res.json(db.prepare("SELECT * FROM classes ORDER BY name").all()));
+app.get("/api/public/classes",(req,res)=>res.json(db.prepare("SELECT * FROM classes WHERE category IN ('Islamiyya','Hifz','Academy') ORDER BY CASE category WHEN 'Islamiyya' THEN 1 WHEN 'Hifz' THEN 2 WHEN 'Academy' THEN 3 ELSE 4 END, id").all()));
 
 app.post("/api/admission",async(req,res)=>{
   const f={
@@ -171,10 +197,10 @@ app.get("/api/admin/dashboard",admin,(req,res)=>{
     fees:db.prepare("SELECT COALESCE(SUM(amount),0) n FROM fees").get().n
   });
 });
-app.get("/api/admin/classes",admin,(req,res)=>res.json(db.prepare("SELECT * FROM classes ORDER BY name").all()));
+app.get("/api/admin/classes",admin,(req,res)=>res.json(db.prepare("SELECT * FROM classes WHERE category IN ('Islamiyya','Hifz','Academy') ORDER BY CASE category WHEN 'Islamiyya' THEN 1 WHEN 'Hifz' THEN 2 WHEN 'Academy' THEN 3 ELSE 4 END, id").all()));
 app.post("/api/admin/classes",admin,(req,res)=>{
   try{
-    db.prepare("INSERT INTO classes(name,section,created_at) VALUES(?,?,?)").run(clean(req.body.name,80),clean(req.body.section,50),now());
+    db.prepare("INSERT INTO classes(name,section,category,created_at) VALUES(?,?,?,?)").run(clean(req.body.name,80),clean(req.body.section,50),clean(req.body.category,40)||"Academy",now());
     res.json({ok:true});
   }catch(e){res.status(400).json({error:"Class already exists or is invalid."})}
 });
@@ -189,6 +215,13 @@ app.post("/api/admin/students",admin,(req,res)=>{
 });
 app.patch("/api/admin/students/:id/status",admin,(req,res)=>{
   db.prepare("UPDATE students SET status=? WHERE id=?").run(clean(req.body.status,20),Number(req.params.id));res.json({ok:true});
+});
+app.patch("/api/admin/students/:id/class",admin,(req,res)=>{
+  const studentId=Number(req.params.id), classId=Number(req.body.classId);
+  if(!studentId || !classId || !db.prepare("SELECT id FROM classes WHERE id=?").get(classId)) return res.status(400).json({error:"Invalid student or class."});
+  db.prepare("UPDATE students SET class_id=? WHERE id=?").run(classId,studentId);
+  const s=db.prepare(`SELECT s.full_name,s.registration_number,c.name class_name,c.category FROM students s LEFT JOIN classes c ON c.id=s.class_id WHERE s.id=?`).get(studentId);
+  res.json({ok:true,student:s});
 });
 app.get("/api/admin/teachers",admin,(req,res)=>res.json(db.prepare("SELECT * FROM teachers ORDER BY id DESC").all()));
 app.post("/api/admin/teachers",admin,(req,res)=>{
